@@ -6,6 +6,9 @@ import streamlit as st
 
 st.set_page_config(page_title="Deteksi Tepi Citra", page_icon="🕷️", layout="wide")
 
+# Batas sisi terpanjang citra agar proses tetap cepat di server
+MAKS_SISI = 1600
+
 # ---------------------------------------------------------------
 # Konfigurasi operator (warna & deskripsi)
 # ---------------------------------------------------------------
@@ -80,24 +83,22 @@ def proses_canny(gray, t1_rendah, t2_rendah, t1_tinggi, t2_tinggi):
             (c_tinggi, f"Canny ({t1_tinggi}, {t2_tinggi})")], c_rendah
 
 
-def baca_citra(file_unggahan):
-    """Baca citra dari upload, atau spider.jpeg bila belum ada upload."""
-    if file_unggahan is not None:
-        data = np.frombuffer(file_unggahan.getvalue(), dtype=np.uint8)
-        bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
-    else:
-        path = Path(__file__).resolve().parent / "spider.jpeg"
-        bgr = cv2.imread(str(path)) if path.exists() else None
-    return bgr
+def decode_citra(file_obj):
+    """Decode berkas unggahan/kamera menjadi array BGR (None bila gagal)."""
+    data = np.frombuffer(file_obj.getvalue(), dtype=np.uint8)
+    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+
+
+def path_contoh():
+    path = Path(__file__).resolve().parent / "spider.jpeg"
+    return path if path.exists() else None
 
 
 # ---------------------------------------------------------------
-# Sidebar
+# Sidebar (parameter)
 # ---------------------------------------------------------------
 with st.sidebar:
     st.header("Pengaturan")
-    unggahan = st.file_uploader("Unggah citra", type=["jpg", "jpeg", "png", "bmp"])
-
     st.subheader("Parameter Canny")
     t1a, t2a = st.slider("Pasangan 1 (lebih banyak tepi)", 0, 500, (50, 100))
     t1b, t2b = st.slider("Pasangan 2 (hanya tepi kuat)", 0, 500, (100, 200))
@@ -106,17 +107,60 @@ with st.sidebar:
 # Halaman utama
 # ---------------------------------------------------------------
 st.title("Deteksi Tepi Citra")
-st.caption("Pilih operator untuk memproses citra.")
+st.caption("Unggah gambar, lalu pilih operator untuk memprosesnya.")
 
-bgr = baca_citra(unggahan)
+# ----- Langkah 1: sumber citra -----
+st.subheader("1. Pilih citra")
+
+sumber_opsi = ["Unggah gambar", "Ambil dari kamera"]
+if path_contoh() is not None:
+    sumber_opsi.append("Gunakan contoh (spider.jpeg)")
+
+sumber = st.radio("Sumber citra", sumber_opsi, horizontal=True, label_visibility="collapsed")
+
+bgr = None
+nama_citra = ""
+
+if sumber == "Unggah gambar":
+    unggahan = st.file_uploader(
+        "Seret & lepas gambar di sini, atau klik Browse files",
+        type=["jpg", "jpeg", "png", "bmp", "webp"],
+        help="Format yang didukung: JPG, JPEG, PNG, BMP, WEBP",
+    )
+    if unggahan is not None:
+        bgr = decode_citra(unggahan)
+        nama_citra = unggahan.name
+elif sumber == "Ambil dari kamera":
+    foto = st.camera_input("Ambil foto")
+    if foto is not None:
+        bgr = decode_citra(foto)
+        nama_citra = "foto_kamera.png"
+else:
+    bgr = cv2.imread(str(path_contoh()))
+    nama_citra = "spider.jpeg"
+
 if bgr is None:
-    st.info("Unggah citra di sidebar untuk memulai (atau letakkan spider.jpeg di folder aplikasi).")
+    if sumber == "Unggah gambar" and unggahan is not None:
+        st.error("Gambar gagal dibaca. Pastikan file valid dan formatnya didukung.")
+    else:
+        st.info("Belum ada citra. Unggah gambar, ambil foto, atau pilih contoh untuk memulai.")
     st.stop()
+
+# Perkecil citra yang terlalu besar
+tinggi, lebar = bgr.shape[:2]
+info_ukuran = f"{nama_citra} - {lebar} x {tinggi} px"
+if max(tinggi, lebar) > MAKS_SISI:
+    skala = MAKS_SISI / max(tinggi, lebar)
+    bgr = cv2.resize(bgr, (int(lebar * skala), int(tinggi * skala)), interpolation=cv2.INTER_AREA)
+    info_ukuran += f" (diperkecil menjadi {bgr.shape[1]} x {bgr.shape[0]} px)"
+st.caption(info_ukuran)
 
 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
 
-# Menu tombol operator
+# ----- Langkah 2: pilih operator -----
+st.subheader("2. Pilih operator")
+
 if "operator" not in st.session_state:
     st.session_state.operator = None
 
@@ -132,7 +176,7 @@ if pilihan is None:
     st.image(rgb, caption="Citra Asli", width=400)
     st.stop()
 
-# Proses sesuai pilihan
+# ----- Hasil -----
 warna = OPERATOR[pilihan]["warna"]
 st.markdown(
     f"<div style='border-left:6px solid {warna};padding:.4rem .9rem;margin:1rem 0;"
