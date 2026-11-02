@@ -4,24 +4,39 @@ import cv2
 import numpy as np
 import streamlit as st
 
-st.set_page_config(page_title="Deteksi Tepi Citra", page_icon="🕷️", layout="wide")
+st.set_page_config(page_title="Segmentasi Hijau Tumbuhan", page_icon="🌿", layout="wide")
 
 # Batas sisi terpanjang citra agar proses tetap cepat di server
 MAKS_SISI = 1600
 
 # ---------------------------------------------------------------
-# Konfigurasi operator (warna & deskripsi)
+# Konfigurasi metode segmentasi (warna & deskripsi)
 # ---------------------------------------------------------------
-OPERATOR = {
-    "Sobel":   {"warna": "#3b82f6", "info": "Kernel 3x3, bobot 2 di tengah. Tepi halus & tahan noise."},
-    "Prewitt": {"warna": "#10b981", "info": "Kernel 3x3, bobot sama rata. Mirip Sobel, lebih sederhana."},
-    "Roberts": {"warna": "#f59e0b", "info": "Kernel 2x2, selisih diagonal. Cepat, tetapi sensitif noise."},
-    "Canny":   {"warna": "#ec4899", "info": "Blur + NMS + hysteresis. Tepi tipis dan bersih."},
+METODE = {
+    "HSV": {
+        "warna": "#16a34a",
+        "info": "Menyaring rentang warna hijau (Hue) pada ruang warna HSV. "
+                "Atur rentang di sidebar.",
+    },
+    "ExG": {
+        "warna": "#65a30d",
+        "info": "Excess Green Index (2G - R - B) + ambang Otsu. "
+                "Menonjolkan dominasi hijau, tahan perubahan cahaya.",
+    },
+    "Lab": {
+        "warna": "#0d9488",
+        "info": "Kanal a* pada ruang warna CIELAB (hijau = nilai a* rendah) + ambang Otsu.",
+    },
+    "Gabungan": {
+        "warna": "#047857",
+        "info": "Irisan mask HSV dan ExG: hanya piksel yang lolos kedua metode. "
+                "Hasil paling ketat, mengurangi salah deteksi.",
+    },
 }
 
 # CSS: beri warna tiap tombol berdasarkan key (class .st-key-<key>)
 css = ""
-for nama, o in OPERATOR.items():
+for nama, o in METODE.items():
     css += f"""
     .st-key-btn_{nama} button {{
         background: {o['warna']}; color: white; border: none;
@@ -37,50 +52,75 @@ st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------
-# Fungsi bantu & operator deteksi tepi
+# Fungsi segmentasi hijau
 # ---------------------------------------------------------------
-def magnitudo_ke_uint8(gx, gy):
-    return np.clip(cv2.magnitude(gx, gy), 0, 255).astype(np.uint8)
+def mask_hsv(bgr, h_min, h_max, s_min, v_min):
+    """Mask hijau dari rentang HSV. (OpenCV: H 0-179, S & V 0-255)."""
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    return cv2.inRange(hsv, (h_min, s_min, v_min), (h_max, 255, 255))
 
 
-def proses_sobel(gray):
-    sx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    sy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    hasil = magnitudo_ke_uint8(sx, sy)
-    return [(cv2.convertScaleAbs(sx), "Gradient X"),
-            (cv2.convertScaleAbs(sy), "Gradient Y"),
-            (hasil, "Sobel")], hasil
+def mask_exg(bgr):
+    """Excess Green: 2g - r - b pada koordinat kromatik, lalu ambang Otsu."""
+    b, g, r = cv2.split(bgr.astype(np.float32))
+    total = b + g + r + 1e-6
+    exg = 2 * (g / total) - (r / total) - (b / total)
+    exg_norm = cv2.normalize(exg, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, mask = cv2.threshold(exg_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return mask, exg_norm
 
 
-def proses_prewitt(gray):
-    kx = np.array([[-1, 0, 1], [-1, 0, 1], [-1, 0, 1]], dtype=np.float32)
-    ky = np.array([[-1, -1, -1], [0, 0, 0], [1, 1, 1]], dtype=np.float32)
-    px = cv2.filter2D(gray, cv2.CV_32F, kx)
-    py = cv2.filter2D(gray, cv2.CV_32F, ky)
-    hasil = magnitudo_ke_uint8(px, py)
-    return [(cv2.convertScaleAbs(px), "Gradient X"),
-            (cv2.convertScaleAbs(py), "Gradient Y"),
-            (hasil, "Prewitt")], hasil
+def mask_lab(bgr):
+    """Kanal a* (hijau = rendah) dibalik, dihaluskan, lalu ambang Otsu."""
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    a_terbalik = 255 - lab[:, :, 1]
+    a_halus = cv2.GaussianBlur(a_terbalik, (5, 5), 0)
+    _, mask = cv2.threshold(a_halus, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return mask, a_halus
 
 
-def proses_roberts(gray):
-    kx = np.array([[1, 0], [0, -1]], dtype=np.float32)
-    ky = np.array([[0, 1], [-1, 0]], dtype=np.float32)
-    rx = cv2.filter2D(gray, cv2.CV_32F, kx)
-    ry = cv2.filter2D(gray, cv2.CV_32F, ky)
-    hasil = magnitudo_ke_uint8(rx, ry)
-    return [(cv2.convertScaleAbs(rx), "Gradient X (diagonal)"),
-            (cv2.convertScaleAbs(ry), "Gradient Y (diagonal)"),
-            (hasil, "Roberts")], hasil
+def bersihkan_mask(mask, ukuran):
+    """Buka (hapus bintik kecil) lalu tutup (isi lubang kecil)."""
+    if ukuran <= 0:
+        return mask
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ukuran, ukuran))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
 
-def proses_canny(gray, t1_rendah, t2_rendah, t1_tinggi, t2_tinggi):
-    blur = cv2.GaussianBlur(gray, (5, 5), sigmaX=1.4)
-    c_rendah = cv2.Canny(blur, t1_rendah, t2_rendah)
-    c_tinggi = cv2.Canny(blur, t1_tinggi, t2_tinggi)
-    return [(blur, "Grayscale + Gaussian Blur"),
-            (c_rendah, f"Canny ({t1_rendah}, {t2_rendah})"),
-            (c_tinggi, f"Canny ({t1_tinggi}, {t2_tinggi})")], c_rendah
+def segmentasi(metode, bgr, p):
+    """Mengembalikan (mask, daftar citra antara [(img, judul)])."""
+    antara = []
+    if metode == "HSV":
+        mask = mask_hsv(bgr, p["h_min"], p["h_max"], p["s_min"], p["v_min"])
+    elif metode == "ExG":
+        mask, exg = mask_exg(bgr)
+        antara.append((exg, "Peta Excess Green"))
+    elif metode == "Lab":
+        mask, a_img = mask_lab(bgr)
+        antara.append((a_img, "Kanal a* (dibalik)"))
+    else:  # Gabungan
+        m_hsv = mask_hsv(bgr, p["h_min"], p["h_max"], p["s_min"], p["v_min"])
+        m_exg, _ = mask_exg(bgr)
+        mask = cv2.bitwise_and(m_hsv, m_exg)
+    return bersihkan_mask(mask, p["morf"]), antara
+
+
+def terapkan_mask(rgb, mask, warna_latar):
+    """Pertahankan piksel hijau, ganti sisanya dengan warna latar."""
+    hasil = np.full_like(rgb, warna_latar)
+    hasil[mask > 0] = rgb[mask > 0]
+    return hasil
+
+
+def buat_overlay(rgb, mask):
+    """Sorot area hijau dengan warna magenta semi transparan."""
+    sorot = np.zeros_like(rgb)
+    sorot[:] = (255, 0, 200)
+    campur = cv2.addWeighted(rgb, 0.45, sorot, 0.55, 0)
+    overlay = rgb.copy()
+    overlay[mask > 0] = campur[mask > 0]
+    return overlay
 
 
 def decode_citra(file_obj):
@@ -94,20 +134,37 @@ def path_contoh():
     return path if path.exists() else None
 
 
+LATAR = {"Hitam": (0, 0, 0), "Putih": (255, 255, 255), "Abu-abu": (128, 128, 128)}
+
 # ---------------------------------------------------------------
 # Sidebar (parameter)
 # ---------------------------------------------------------------
 with st.sidebar:
     st.header("Pengaturan")
-    st.subheader("Parameter Canny")
-    t1a, t2a = st.slider("Pasangan 1 (lebih banyak tepi)", 0, 500, (50, 100))
-    t1b, t2b = st.slider("Pasangan 2 (hanya tepi kuat)", 0, 500, (100, 200))
+
+    st.subheader("Rentang HSV hijau")
+    st.caption("Dipakai oleh metode HSV dan Gabungan.")
+    h_min, h_max = st.slider("Hue (warna)", 0, 179, (35, 85),
+                             help="Hijau pada OpenCV berkisar sekitar 35-85.")
+    s_min = st.slider("Saturasi minimum", 0, 255, 40,
+                      help="Naikkan untuk membuang warna pucat/keabu-abuan.")
+    v_min = st.slider("Kecerahan minimum (Value)", 0, 255, 40,
+                      help="Naikkan untuk membuang area yang terlalu gelap.")
+
+    st.subheader("Pembersihan mask")
+    morf = st.slider("Ukuran kernel morfologi", 0, 15, 3,
+                     help="0 = tanpa pembersihan. Semakin besar, bintik kecil makin hilang.")
+
+    st.subheader("Tampilan")
+    nama_latar = st.radio("Warna latar hasil", list(LATAR), horizontal=True)
+
+params = {"h_min": h_min, "h_max": h_max, "s_min": s_min, "v_min": v_min, "morf": morf}
 
 # ---------------------------------------------------------------
 # Halaman utama
 # ---------------------------------------------------------------
-st.title("Deteksi Tepi Citra")
-st.caption("Unggah gambar, lalu pilih operator untuk memprosesnya.")
+st.title("Segmentasi Hijau Tumbuhan")
+st.caption("Unggah foto tumbuhan, lalu pilih metode untuk memisahkan area berwarna hijau.")
 
 # ----- Langkah 1: sumber citra -----
 st.subheader("1. Pilih citra")
@@ -120,6 +177,7 @@ sumber = st.radio("Sumber citra", sumber_opsi, horizontal=True, label_visibility
 
 bgr = None
 nama_citra = ""
+unggahan = None
 
 if sumber == "Unggah gambar":
     unggahan = st.file_uploader(
@@ -140,7 +198,7 @@ else:
     nama_citra = "spider.jpeg"
 
 if bgr is None:
-    if sumber == "Unggah gambar" and unggahan is not None:
+    if unggahan is not None:
         st.error("Gambar gagal dibaca. Pastikan file valid dan formatnya didukung.")
     else:
         st.info("Belum ada citra. Unggah gambar, ambil foto, atau pilih contoh untuk memulai.")
@@ -156,58 +214,65 @@ if max(tinggi, lebar) > MAKS_SISI:
 st.caption(info_ukuran)
 
 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
 
-# ----- Langkah 2: pilih operator -----
-st.subheader("2. Pilih operator")
+# ----- Langkah 2: pilih metode -----
+st.subheader("2. Pilih metode segmentasi")
 
-if "operator" not in st.session_state:
-    st.session_state.operator = None
+if "metode" not in st.session_state:
+    st.session_state.metode = None
 
-kolom = st.columns(len(OPERATOR))
-for col, nama in zip(kolom, OPERATOR):
+kolom = st.columns(len(METODE))
+for col, nama in zip(kolom, METODE):
     with col:
         if st.button(nama, key=f"btn_{nama}", use_container_width=True):
-            st.session_state.operator = nama
+            st.session_state.metode = nama
 
-pilihan = st.session_state.operator
+pilihan = st.session_state.metode
 
 if pilihan is None:
     st.image(rgb, caption="Citra Asli", width=400)
     st.stop()
 
 # ----- Hasil -----
-warna = OPERATOR[pilihan]["warna"]
+warna = METODE[pilihan]["warna"]
 st.markdown(
     f"<div style='border-left:6px solid {warna};padding:.4rem .9rem;margin:1rem 0;"
-    f"background:{warna}22;border-radius:6px'><b>{pilihan}</b> - {OPERATOR[pilihan]['info']}</div>",
+    f"background:{warna}22;border-radius:6px'><b>{pilihan}</b> - {METODE[pilihan]['info']}</div>",
     unsafe_allow_html=True,
 )
 
 with st.spinner(f"Memproses {pilihan}..."):
-    if pilihan == "Sobel":
-        tampil, hasil = proses_sobel(gray)
-    elif pilihan == "Prewitt":
-        tampil, hasil = proses_prewitt(gray)
-    elif pilihan == "Roberts":
-        tampil, hasil = proses_roberts(gray)
-    else:
-        tampil, hasil = proses_canny(gray, t1a, t2a, t1b, t2b)
+    mask, antara = segmentasi(pilihan, bgr, params)
+    hasil = terapkan_mask(rgb, mask, LATAR[nama_latar])
+    overlay = buat_overlay(rgb, mask)
 
-daftar = [(rgb, "Citra Asli")] + tampil
+daftar = [(rgb, "Citra Asli")] + antara + [
+    (mask, "Mask Hijau"),
+    (hasil, "Hasil Segmentasi"),
+    (overlay, "Overlay Area Hijau"),
+]
 kolom_hasil = st.columns(len(daftar))
 for col, (img, judul) in zip(kolom_hasil, daftar):
     with col:
         st.image(img, caption=judul, use_container_width=True, clamp=True)
 
-if pilihan == "Canny":
-    m1, m2 = st.columns(2)
-    # tampil[1] dan tampil[2] adalah dua hasil Canny
-    m1.metric(f"Piksel tepi Canny ({t1a}, {t2a})", int(np.count_nonzero(tampil[1][0])))
-    m2.metric(f"Piksel tepi Canny ({t1b}, {t2b})", int(np.count_nonzero(tampil[2][0])))
+# Statistik area hijau
+piksel_hijau = int(np.count_nonzero(mask))
+persen = piksel_hijau / mask.size * 100
+m1, m2, m3 = st.columns(3)
+m1.metric("Area hijau", f"{persen:.1f}%")
+m2.metric("Piksel hijau", f"{piksel_hijau:,}")
+m3.metric("Piksel non-hijau", f"{mask.size - piksel_hijau:,}")
 
-# Tombol unduh hasil
-ok, png = cv2.imencode(".png", hasil)
-if ok:
-    st.download_button(f"Unduh hasil {pilihan} (PNG)", png.tobytes(),
-                       file_name=f"hasil_{pilihan.lower()}.png", mime="image/png")
+# Tombol unduh
+d1, d2 = st.columns(2)
+ok1, png_hasil = cv2.imencode(".png", cv2.cvtColor(hasil, cv2.COLOR_RGB2BGR))
+ok2, png_mask = cv2.imencode(".png", mask)
+if ok1:
+    d1.download_button(f"Unduh hasil segmentasi {pilihan} (PNG)", png_hasil.tobytes(),
+                       file_name=f"segmentasi_{pilihan.lower()}.png", mime="image/png",
+                       use_container_width=True)
+if ok2:
+    d2.download_button(f"Unduh mask {pilihan} (PNG)", png_mask.tobytes(),
+                       file_name=f"mask_{pilihan.lower()}.png", mime="image/png",
+                       use_container_width=True)
